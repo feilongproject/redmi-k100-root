@@ -18,6 +18,20 @@
 
   KernelSU 以 LKM（可加载模块）方式运行，只存在于内存，重启即失效。
 
+本次修复：拔数据线不再卡死重启
+----------------------------------------
+  现象：脚本跑完后拔线，手机卡死并自动重启。
+
+  原因：adb shell 启动的进程本身就是 session leader（SID==PID==PGID），
+        exploit 里的 setsid() 会因 EPERM 失败，进程实际仍留在 adbd 的会话里。
+        拔线时 adbd 回收整个会话，park 住的进程被回收，伪 cred 页提前释放，
+        内核 panic -> 重启。
+
+  修复：改用 /system/bin/setsid 派生一个常驻父 shell，由它 fork 出 exploit，
+        使 exploit 自己成功调用 setsid() 成为 session leader（session==pid）。
+        实测 adb kill-server 后设备 uptime 连续、park 进程存活、无重启。
+        脚本阶段 3 会打印“主进程已脱离 adbd 会话（session leader），拔线安全”。
+
 前置条件
 ----------------------------------------
   1. Windows 10/11，能运行 PowerShell 5.1 或 7
@@ -39,11 +53,11 @@
 执行流程
 ----------------------------------------
   阶段 0  检查设备、机型、内核、bin 文件完整性
-  阶段 1  推送 cve98260 / profile.bin / ksud 到 /data/local/tmp
+  阶段 1  推送 cve98260 / profile.bin / run_exploit.sh / ksud 到 /data/local/tmp
   阶段 2  calibrate-a 求 KASLR slide，calibrate-b 求 page_offset
-          （带校验：slide 必须 2MiB 对齐且命中数 >= 64，
+          （校验：slide 必须 2MiB 对齐且命中数 >= 64，
             page_offset 必须等于 profile 值，否则自动重试，最多 4 次）
-  阶段 3  exploit 注入，轮询 rootd 拿 uid=0（约 20 秒 ~ 5 分钟）
+  阶段 3  在独立会话中注入，轮询 rootd 拿 uid=0，并校验会话已脱离 adbd
   阶段 4  ksud late-load 加载 KernelSU 模块，校验 /proc/modules
   阶段 5  输出总结
 
@@ -62,8 +76,8 @@
     结果是 adb shell 里暂时没有 /system/bin/su，
     提权请用：adb shell "cd /data/local/tmp && ./cve98260 su -c <命令>"
 
-  · 管理器里出现「超级用户」待授权请求时，可在界面上手动授予。
-    模块加载后 SELinux 会回到 Enforcing，这是 KernelSU 的正常行为。
+  · 模块加载后 SELinux 会回到 Enforcing，此时上述 su 可能被拒；
+    这是 KernelSU 的正常行为，重新跑脚本即可再次拿到 root。
 
   · 临时 root 和 KSU 都只在内存里，重启后需重新运行本脚本。
 
@@ -77,12 +91,11 @@
       开启 USB 调试，手机上点「允许 USB 调试」，重新插拔数据线。
 
   · 阶段 2 校准连续失败
-      多半是刚开机负载太高。等 1~2 分钟、熄屏后再跑；
+      多半是刚开机负载太高。等 1~2 分钟后再跑；
       持续失败则说明内核已变，profile 需要重新生成。
 
-  · 阶段 3 失败
-      重启手机后重跑。重启是唯一干净的清理方式，
-      不要 kill /data/local/tmp/cve98260 进程（可能持有内核对象）。
+  · 阶段 3 提示“注入进程已退出且未拿到 root”
+      概率性失败，重启手机后重跑即可（通常 1~3 次内成功）。
 
   · 阶段 4 设备断开
       说明 KSU 阶段触发了 panic 重启，属已知风险；
@@ -99,7 +112,8 @@
   bin/cve98260      exploit 主程序（arm64，静态 PIE）
   bin/profile.bin   308 字节内核偏移表（按本构建 kallsyms 生成）
   bin/ksud          KernelSU 用户态（late-load 用）
+  run_exploit.sh    设备侧启动器（供 setsid 调用）
   ksu_step.sh       在 rootd 下执行的 KSU 加载脚本
   root.ps1          主逻辑
   一键ROOT.bat      双击入口
-  log/              每次运行的日志（run-*.log、exploit-*.out）
+  log/              每次运行的日志（run-*.log）
